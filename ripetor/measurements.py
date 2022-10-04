@@ -1,6 +1,8 @@
 import json
+import logging
 from datetime import datetime
 import os
+from ipaddress import ip_address
 
 MAX_ELEMENTS_PER_CASE = 1000
 CHUNK_SIZE = 30  # Because 100 is the limit, and some do not finish, 30 are for sure free
@@ -15,12 +17,12 @@ def template_measurement():
     }
 
 
-def template_definition():
+def template_definition(ip_version="ipv4"):
     return {
         "target": "TARGET",
         "description": "DESCRIPTION",
         "type": "traceroute",
-        "af": 4,
+        "af": 6 if ip_version == "ipv6" else 4,
         "is_public": True,
         "protocol": "ICMP",
         "response_timeout": 20000,
@@ -50,7 +52,7 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 
-def create_one_to_many(measurement_name, endpoint_set, relay_set):
+def create_one_to_many(measurement_name, endpoint_set, relay_set, ip_version="ipv4"):
     relay_set_items = list(relay_set.items())[:MAX_ELEMENTS_PER_CASE]
 
     measurement_list = []
@@ -59,11 +61,10 @@ def create_one_to_many(measurement_name, endpoint_set, relay_set):
         measurement = template_measurement()
 
         for asn, o in chunked_relay_set_items:
+            ip, separator, port = o["relays"][0]["or_addresses"].rpartition(':')
 
-            ip, port = o["relays"][0]["or_addresses"].split(":")
-
-            definition = template_definition()
-            definition["target"] = ip
+            definition = template_definition(ip_version)
+            definition["target"] = ip.strip("[]") #strip brackets for ipv6
             if port and port != "0":
                 definition["port"] = int(port)
             definition["description"] = measurement_name
@@ -81,12 +82,22 @@ def create_one_to_many(measurement_name, endpoint_set, relay_set):
     return measurement_list
 
 
-def create_many_to_one(measurement_name, probe_set, endpoint_set):
+def create_many_to_one(measurement_name, probe_set, endpoint_set, ip_version="ipv4"):
     measurement = template_measurement()
 
-    for ip, port in [v.split(":") for v in endpoint_set["addresses"]]:
-        definition = template_definition()
-        definition["target"] = ip
+    for addrs in endpoint_set["addresses"]:
+        target_addrs_v4 = [addr for addr in addrs if "[" not in addr]
+        target_addrs_v6 = [addr for addr in addrs if "[" in addr]
+        target_addrs = target_addrs_v6 if ip_version == "ipv6" else target_addrs_v4
+
+        if len(target_addrs) == 0:
+            logging.warning(f'No target addresses found!')
+            continue
+
+        addr = target_addrs[0]
+        ip, separator, port = addr.rpartition(':')
+        definition = template_definition(ip_version)
+        definition["target"] = ip.strip("[]")
         if port and port != "0":
             definition["port"] = int(port)
         definition["description"] = measurement_name
@@ -103,20 +114,20 @@ def create_many_to_one(measurement_name, probe_set, endpoint_set):
     return [measurement]
 
 
-def create_case1(measurement_name, c_as, g_as):
-    return create_one_to_many(measurement_name + "-c1", c_as, g_as)
+def create_case1(measurement_name, c_as, g_as, ip_version="ipv4"):
+    return create_one_to_many(measurement_name + "-c1", c_as, g_as, ip_version)
 
 
-def create_case2(measurement_name, e_as_r, d_as):
-    return create_many_to_one(measurement_name + "-c2", e_as_r, d_as)
+def create_case2(measurement_name, e_as_r, d_as, ip_version="ipv4"):
+    return create_many_to_one(measurement_name + "-c2", e_as_r, d_as, ip_version)
 
 
-def create_case3(measurement_name, d_as, e_as):
-    return create_one_to_many(measurement_name + "-c3", d_as, e_as)
+def create_case3(measurement_name, d_as, e_as, ip_version="ipv4"):
+    return create_one_to_many(measurement_name + "-c3", d_as, e_as, ip_version)
 
 
-def create_case4(measurement_name, g_as_r, c_as):
-    return create_many_to_one(measurement_name + "-c4", g_as_r, c_as)
+def create_case4(measurement_name, g_as_r, c_as, ip_version="ipv4"):
+    return create_many_to_one(measurement_name + "-c4", g_as_r, c_as, ip_version)
 
 
 def calculate_costs_for_measurement_set(measurement_set):
@@ -187,48 +198,66 @@ if __name__ == '__main__':
     main()
 
 
-def create_probes_set(probes):
-    probes_per_as = dict()
+def create_probes_set(probes, ip_version="ipv4"):
+    probes_per_as_v4 = dict()
+    probes_per_as_v6 = dict()
     for p in probes["objects"]:
         if p["status_name"] == "Connected":
-            probes_per_as.setdefault("AS" + str(p["asn_v4"]), []).append(p["id"])
-    return probes_per_as
+            as_ipv4 = f"AS{p['asn_v4']}"
+            as_ipv6 = f"AS{p['asn_v6']}"
+            if as_ipv4:
+                probes_per_as_v4.setdefault(as_ipv4, []).append(p["id"])
+            if as_ipv6:
+                probes_per_as_v6.setdefault(as_ipv6, []).append(p["id"])
+    return probes_per_as_v6 if ip_version == "ipv6" else probes_per_as_v4
 
 
-def create_guard_set(details):
+def create_guard_set(details, ip_version):
     """Create (ii) g-as."""
-    return create_simple_set(details, "Guard")
+    return create_simple_set(details, "Guard", ip_version)
 
 
-def create_exit_set(details):
+def create_exit_set(details, ip_version):
     """Create (iv) e-as."""
-    return create_simple_set(details, "Exit")
+    return create_simple_set(details, "Exit", ip_version)
 
 
-def create_simple_set(details, filtr):
-    relay_per_as = {}
+def create_simple_set(details, filtr, ip_version="ipv4"):
+    relay_per_as_v4 = {}
+    relay_per_as_v6 = {}
     for r in details["relays"]:
         if filtr in r["flags"]:
             if "as" in r:
-                relay_per_as.setdefault(str(r["as"]), {"relays": []})["relays"].append({"fingerprint": r["fingerprint"],
+                r_addrs = r["or_addresses"]
+                # remove brackets at ipv6 addrs since we parse them anyway
+                #r_addrs = [addr.strip("[]") for addr in r_addrs]
+                #ipv4_addrs = [addr for addr in r_addrs if ip_address(addr).version == 4]
+                #ipv6_addrs = [addr for addr in r_addrs if ip_address(addr).version == 6]
+                ipv4_addrs = [addr for addr in r_addrs if not "[" in addr]
+                ipv6_addrs = [addr for addr in r_addrs if "[" in addr]
+                if ipv4_addrs:
+                    relay_per_as_v4.setdefault(str(r["as"]), {"relays": []})["relays"].append({"fingerprint": r["fingerprint"],
                                                                                         "or_addresses":
-                                                                                            r["or_addresses"][0]})
-    return relay_per_as
+                                                                                            ipv4_addrs[0]})
+                if ipv6_addrs:
+                    relay_per_as_v6.setdefault(str(r["as"]), {"relays": []})["relays"].append({"fingerprint": r["fingerprint"],
+                                                                                        "or_addresses":
+                                                                                            ipv6_addrs[0]})
+    return relay_per_as_v6 if ip_version == "ipv6" else relay_per_as_v4
 
-
-def create_guard_with_ripe_probes_set(details, probes):
+def create_guard_with_ripe_probes_set(details, probes, ip_version):
     """Create (iii) g-as-r."""
-    return create_set_with_ripe_probes(details, probes, "Guard")
+    return create_set_with_ripe_probes(details, probes, "Guard", ip_version)
 
 
-def create_exit_with_ripe_probes_set(details, probes):
+def create_exit_with_ripe_probes_set(details, probes, ip_version):
     """Create (v) e-as-r."""
-    return create_set_with_ripe_probes(details, probes, "Exit")
+    return create_set_with_ripe_probes(details, probes, "Exit", ip_version)
 
 
-def create_set_with_ripe_probes(details, probes, filtr):
-    relay_per_as = create_simple_set(details, filtr)
-    probes = create_probes_set(probes)
+def create_set_with_ripe_probes(details, probes, filtr, ip_version):
+    relay_per_as = create_simple_set(details, filtr, ip_version)
+    probes = create_probes_set(probes, ip_version)
 
     as_to_delete = []
 

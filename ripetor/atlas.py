@@ -2,16 +2,21 @@ import argparse
 import json
 import logging
 import os
+import pathlib
 import time
 import requests
 
-BASE_URL = "https://webhook.site/8d482d35-ee70-4d12-a4d2-1428fa32813d/"
-API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+BASE_URL = "https://atlas.ripe.net/api/v2/measurements/"  # "https://webhook.site/8d482d35-ee70-4d12-a4d2-1428fa32813d/"
+API_KEY = os.getenv("RIPE_KEY")
+
+if API_KEY is None:
+    logging.error("No API key found at env variable 'RIPE_KEY'")
+    exit(1)
 
 
 def start_definition(definition):
     logging.info("Start definition")
-    response = requests.post(BASE_URL+"?key="+API_KEY, json=definition)
+    response = requests.post(BASE_URL + "?key=" + API_KEY, json=definition)
     if response.ok:
         logging.info("  response okay")
         return response.json()
@@ -43,6 +48,28 @@ def any_measurement_running():
         return False
 
 
+def get_measurement_status(measurement_id, update=False):
+    """
+    retrieves the status of the given measurement and returns the json if status == 200 otherwise None
+    if update is set to True, it will also send a PATCH before to request a status update
+    """
+    measurement_id = str(measurement_id)
+    measurement_id = measurement_id.strip()
+    api_url = f'{BASE_URL}{measurement_id}'
+
+    if update:
+        patch_url = f'{api_url}?key={API_KEY}'
+        response = requests.patch(patch_url)
+        if response.status_code != 200:
+            return None
+
+    response = requests.get(api_url)
+    if response.status_code != 200:
+        return None
+
+    return response.json()
+
+
 def measurement_not_running(measurement_id):
     response = requests.get(BASE_URL + str(measurement_id))
 
@@ -65,7 +92,7 @@ def retrieve_measurement(measurement_id):
         result = response.json()
         return result
     else:
-        logging.error("Download measurement: %d not successfull", measurement_id)
+        logging.error(f"{measurement_id} - HTTP Error {response.status_code}")
         logging.error(response.content)
 
 
@@ -76,29 +103,22 @@ def stop_measurement(measurement_id):
         logging.debug("measurement %d deleted", measurement_id)
         logging.debug(response.content)
     else:
-        logging.warning("measurement delete error, maybe cannot be deleted")
+        logging.warning(f"{measurement_id} measurement delete error, maybe cannot be deleted")
         logging.warning(response.content)
 
 
-def update_measurement_stupid(measurement_id):
+def update_measurement(measurement_id):
     """Do this because RIPE Atlas sometimes does not update the measurement status until PATCH"""
     logging.debug("PATCH " + BASE_URL + str(measurement_id))
     response = requests.patch(BASE_URL + str(measurement_id) + "?key=%s" % API_KEY, json={"is_public": True})
     if response.ok:
-        logging.debug("measurement %d patched")
-        logging.debug(response.content)
+        logging.debug(f"Measurement {measurement_id} patched")
     else:
+        logging.error(f'Could not PATCH existing measurement:')
         logging.error(response.content)
 
 
-def download_everything(base_dir, measurement_responses):
-    downloaded_files = 0
-
-    os.makedirs(base_dir + "/case1", exist_ok=True)
-    os.makedirs(base_dir + "/case2", exist_ok=True)
-    os.makedirs(base_dir + "/case3", exist_ok=True)
-    os.makedirs(base_dir + "/case4", exist_ok=True)
-
+def update_downloaded_finished(measurement_responses):
     for m_id in measurement_responses["downloaded"]:
         # Check status
         # ... if still active, kill it again and patch it
@@ -110,79 +130,113 @@ def download_everything(base_dir, measurement_responses):
         else:
             # Send DELETE again
             stop_measurement(m_id)
-            # Send unnecessary UPDATE
-            update_measurement_stupid(m_id)
+            # Send PATCH to update the current status as RIPE does not keep status continuously updated
+            update_measurement(m_id)
 
-        # Update List
+    # Update downloaded list to remove the ones that have been finished
     measurement_responses["downloaded"] = [m for m in measurement_responses["downloaded"] if m not in measurement_responses["finished"]]
 
-    for m_id in measurement_responses["finished"]:
-        pass
+
+def download_everything(base_dir, measurement_responses):
+    """
+    Will try to download all running measurements exactly one time.
+    This method will NOT retry to download, call method multiple times with some delay.
+    Will do some housekeeping to keep track of running, downloaded and finished measurements.
+    """
+    base_path = pathlib.Path(base_dir)
+    downloaded_files = 0
+
+    # Check all measurements that have already been downloaded
+    update_downloaded_finished(measurement_responses)
 
     for case, m_id_list in measurement_responses.items():
-        if case not in ("downloaded", "finished"):  # Must be running case1-case4
+        # ignore helper categories
+        if case in ["downloaded", "finished"]:
+            continue
 
-            for m_id in m_id_list:
-                fn = base_dir + "/" + case + "/" + str(m_id) + ".json"
+        # create our case directory from the base path
+        case_dir = base_path.joinpath(case)
+        case_dir.mkdir(parents=True, exist_ok=True)
 
-                if os.path.isfile(fn):
-                    # Should not happen any more except for case2 and case4
-                    # if case in ("case1", "case3"):
-                    #     logging.warning("... check measurement for  %d ... exists" % m_id)
-                    #     measurement_responses["downloaded"].append(m_id)
-                    # else:
-                        logging.info(" ... update measurement for %s %d" % (case, m_id))
+        for m_id in m_id_list:
+            # Replaced: fn = base_dir + "/" + case + "/" + str(m_id) + ".json"
+            # Build filepath from case path
+            file_name = str(m_id).strip()
+            fn = case_dir.joinpath(f'{file_name}.json')
 
-                        with open(fn, "r+") as fp:
-                            res_old = json.load(fp)
-                            logging.debug(" ... res old has %d " % len(res_old))
-                            m_json = retrieve_measurement(m_id)
-                            logging.debug(" ... res new has %d " % len(m_json))
-                            # New result is larger than old one
-                            if isinstance(m_json, list) and len(m_json) > len(res_old):
-                                fp.seek(0)
-                                json.dump(m_json, fp, indent=2)
-                                fp.truncate()
-                            # Nothing New, think about to stop it
-                            elif isinstance(m_json, list) and len(m_json) == len(res_old):
-                                stop_measurement(m_id)
-                                measurement_responses["downloaded"].append(m_id)
-                else:
-                    logging.debug("... check measurement %d ... download" % m_id)
-                    m_json = retrieve_measurement(m_id)
-                    if isinstance(m_json, list) and len(m_json) == 0:
-                        # No Result Ready - Skip
-                        logging.debug("... %d has no result yet" % m_id)
-                    elif isinstance(m_json, list) and len(m_json) > 0:
-                        # Result is there - Download and DELETE
-                        logging.info("... write result %s %d" % (case, m_id))
-                        with open(fn, "w") as f:
-                            json.dump(m_json, f, indent=2)
-                            downloaded_files += 1
+            # Grab the results for this measurement
+            m_json = retrieve_measurement(m_id)
+            # check if we actually got a result
+            if m_json is None:
+                logging.warning(f'Could not download measurement result {m_id}')
+                continue
+            elif isinstance(m_json, list) and len(m_json) == 0:
+                # Removing logging for empty result, this just spams the console
+                # apparently this case happens more often than thought
+                # logging.warning(f'Got empty result for {m_id}')
+                continue
 
-                        logging.info("... stop measurement %s %d" % (case, m_id))
+            # If we already have downloaded some results for a measurement,
+            # open the existing file and compare the results
+            # if there are more responses in the new file than in the old one, keep the measurement as active
+            # i.e. do not add the measurement into the downloaded helper category
+            # if however we have the same number of results, we add the measurement to the downloaded category
+            # thus sending a stop measurement to ripe
+            if fn.is_file():
+                # Should not happen anymore except for case2 and case4
+                # if case in ("case1", "case3"):
+                #     logging.warning("... check measurement for  %d ... exists" % m_id)
+                #     measurement_responses["downloaded"].append(m_id)
+                # else:
+                logging.info(f'{m_id}: Updating existing result for {case}')
 
-                        # Quick Hack, I want case 2 and case4 to be checked more often
-                        # TODO If CAS OR DAS > 1
-                        # if case in ("case1", "case3"):/
-                        #     stop_measurement(m_id)
-                        #     measurement_responses["downloaded"].append(m_id)
+                with open(fn, "r+") as fp:
+                    res_old = json.load(fp)
+                    logging.debug(f'{m_id}: res old - new: {len(res_old)} - {len(m_json)}')
 
-            # Update List
-            measurement_responses[case] = [m for m in m_id_list if m not in measurement_responses["downloaded"]]
+                    if isinstance(m_json, list) and len(m_json) > len(res_old):
+                        # New result is larger than old one, keep the measurement as active
+                        # Do NOT mark the measurement as downloaded or something
+                        fp.seek(0)
+                        json.dump(m_json, fp, indent=2)
+                        fp.truncate()
+                    elif isinstance(m_json, list) and len(m_json) == len(res_old):
+                        # Result did not change, add to downloaded list
+                        stop_measurement(m_id)
+                        measurement_responses["downloaded"].append(m_id)
+            else:
+                # Found result for measurement, download it
+                logging.debug("write result %s %d" % (case, m_id))
+                with open(fn, "w") as f:
+                    json.dump(m_json, f, indent=2)
+                    downloaded_files += 1
 
-    logging.info("Downloaded %d new files (from %d responses at this time)" %
-                 (downloaded_files, sum(map(len, measurement_responses.values()))))
+                # logging.info(f'{m_id} ({case}) Stopping Measurement')
+                # Quick Hack, I want case 2 and case4 to be checked more often
+                # TODO If CAS OR DAS > 1
+                # if case in ("case1", "case3"):
+                #     stop_measurement(m_id)
+                #     measurement_responses["downloaded"].append(m_id)
+
+        # Update List of still running cases within each case
+        measurement_responses[case] = [m for m in m_id_list if m not in measurement_responses["downloaded"]]
+
+    total_responses = sum(map(len, measurement_responses.values()))
+    logging.info(f"Downloaded {downloaded_files} new files (from {total_responses} responses at this time)")
 
 
 def wait_and_download(result_dir, measurement_responses, nr_measurement=0):
     if nr_measurement:
+        # MM: get ALL running measurements on the given API key
+        # this does also include non-involved measurements
         running = get_measurements_running()
         while running["count"] + nr_measurement > MAX_MEASUREMENTS:
-            logging.info(" ... waiting %d seconds; %d running and %d to start" %
-                         (WAIT_TIME_SECONDS, running["count"], nr_measurement))
+            logging.info(
+                f'Waiting {WAIT_TIME_SECONDS} seconds; {running["count"]} running and {nr_measurement} to start'
+            )
             time.sleep(WAIT_TIME_SECONDS)
 
+            # MM: Try to download all currently running measurements
             download_everything(result_dir, measurement_responses)
 
             running = get_measurements_running()
@@ -210,7 +264,7 @@ def kill_all_running_measurements():
 
         for m in running["results"]:
             logging.info(f"... patch {m['id']}")
-            update_measurement_stupid((m["id"]))
+            update_measurement((m["id"]))
 
         logging.info("Wait 10 seconds")
         time.sleep(10)

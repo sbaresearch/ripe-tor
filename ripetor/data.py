@@ -7,7 +7,8 @@ import logging
 
 DETAILS_ULR = "https://onionoo.torproject.org/details"
 PROBES_URL = "https://ftp.ripe.net/ripe/atlas/probes/archive/meta-latest"
-IP2ASN_URL = "https://iptoasn.com/data/ip2asn-v4.tsv.gz"
+IP2ASN_V4_URL = "https://iptoasn.com/data/ip2asn-v4.tsv.gz"
+IP2ASN_V6_URL = "https://iptoasn.com/data/ip2asn-v6.tsv.gz"
 
 
 def download_details(details_filename):
@@ -27,14 +28,21 @@ def download_probes(probes_filename):
             f.write(unzip)
 
 
-def download_ip2asn(ip2asn_filename):
-    logging.info("Downloading ip2asn from %s" % IP2ASN_URL)
+def download_ip2asn_v4(ip2asn_filename):
+    logging.info("Downloading ip2asn_v4 from %s" % IP2ASN_V4_URL)
     if not os.path.isfile(ip2asn_filename):
-        r = requests.get(IP2ASN_URL)
+        r = requests.get(IP2ASN_V4_URL)
         with open(ip2asn_filename, 'wb') as f:
             unzip = gzip.decompress(r.content)
             f.write(unzip)
 
+def download_ip2asn_v6(ip2asn_filename):
+    logging.info("Downloading ip2asn_v6 from %s" % IP2ASN_V6_URL)
+    if not os.path.isfile(ip2asn_filename):
+        r = requests.get(IP2ASN_V6_URL)
+        with open(ip2asn_filename, 'wb') as f:
+            unzip = gzip.decompress(r.content)
+            f.write(unzip)
 
 def load_details(filename):
     if not os.path.isfile(filename):

@@ -1,28 +1,46 @@
 # TODO Refactor messed up file
+import argparse
+import pathlib
 
-from ripetor import data
-import json
+import data
+import ip2as
+
 import os
-
-import ip2asn
+import json
 import logging
 
-BASE_DIR = "../run/"
+
+try:
+    from ripetor.statistics import get_current_relays
+except:
+    from statistics import get_current_relays
+
+BASE_DIR = "run/"
 
 
-def load_as_statistic(details):
+def load_as_statistic(details, ipv6=False):
     """Load the AS Statistic from details... Sum up the guard/exit probability from all Relays in one AS"""
     logging.info("Load AS statistics from details")
-    relays = details["relays"]
-    stat = {"guard":{}, "exit":{}}
+    stat = {"guard": {}, "exit": {}}
+
+    _, relays_ipv4, relays_ipv6, _ = get_current_relays(details)
+
+    relays = relays_ipv4
+    guard_probability = "guard_probability"
+    exit_probability = "exit_probability"
+    if ipv6:
+        # use different subset
+        relays = relays_ipv6
+        guard_probability = "guard_probability_v6"
+        exit_probability = "exit_probability_v6"
 
     for r in relays:
         if "as" in r:
             asn = r["as"]
             if "guard_probability" in r and r["guard_probability"] != 0:
-                stat["guard"][asn] = stat["guard"].get(asn, 0) + r["guard_probability"]
+                stat["guard"][asn] = stat["guard"].get(asn, 0) + r[guard_probability]
             if "exit_probability" in r and r["exit_probability"] != 0:
-                stat["exit"][asn] = stat["exit"].get(asn, 0) + r["exit_probability"]
+                stat["exit"][asn] = stat["exit"].get(asn, 0) + r[exit_probability]
 
     return stat
 
@@ -59,10 +77,11 @@ def get_probability_for_route(as_statistic, case, asn):
 
 def analyze_case(as_statistic, run_name, case):
     """Load and analyze one full case based on all downloaded results"""
+    result_cnt = 0
 
     logging.info("Start analyzing measurement %s %s" % (run_name, case))
 
-    measurement_dir = BASE_DIR + run_name + "/"
+    measurement_dir = BASE_DIR + '/' + run_name + "/"
     download_dir = measurement_dir + "measurement-results/" + case + "/"
 
     basic_logger = logging.getLogger("basic_logger")
@@ -94,6 +113,7 @@ def analyze_case(as_statistic, run_name, case):
 
         # This is necessary for case2 and case4 where all results are in one measurement
         for result in results:
+            result_cnt += 1
 
             # Get the ASN set from the traceroute result
             ip_list = get_asn_set_from_traceroute(result)
@@ -107,21 +127,21 @@ def analyze_case(as_statistic, run_name, case):
             # For Case1 and Case3 the probability depends on the Destination
             if case in ("case1", "case3"):  # Check the AS of the measurement
                 # TODO Check ob mit dst_adr möglich oder anders notwendig
-                route_asn = ip2asn.ip2asn(result["dst_addr"])
-                multidestasn = ip2asn.ip2asn(result["from"])
+                route_asn = ip2as.ip2asn(result["dst_addr"])
+                multidestasn = ip2as.ip2asn(result["from"])
 
                 logging.info("%s dst: %15s - ASN: %8s - %s  from: %15s - ASN: %8s - %s" % (case,
-                                                                                           result["dst_addr"], route_asn, ip2asn.get_as_name(route_asn)[:20],
-                                                                                           result["from"], multidestasn, ip2asn.get_as_name(multidestasn)[:20]))
+                                                                                           result["dst_addr"], route_asn, ip2as.get_as_name(route_asn)[:20],
+                                                                                           result["from"], multidestasn, ip2as.get_as_name(multidestasn)[:20]))
 
             # For Case2 and Case4 the probability depends on the From Address
             elif case in ("case2", "case4"):
-                route_asn = ip2asn.ip2asn(result["from"])
-                multidestasn = ip2asn.ip2asn(result["dst_addr"])
+                route_asn = ip2as.ip2asn(result["from"])
+                multidestasn = ip2as.ip2asn(result["dst_addr"])
 
                 logging.info("%s From: %15s - ASN: %8s - %s   dst: %15s - ASN: %8s - %s" % (case,
-                                                                                            result["from"], route_asn, ip2asn.get_as_name(route_asn)[:20],
-                                                                                            result["dst_addr"], multidestasn, ip2asn.get_as_name(multidestasn)[:20]))
+                                                                                            result["from"], route_asn, ip2as.get_as_name(route_asn)[:20],
+                                                                                            result["dst_addr"], multidestasn, ip2as.get_as_name(multidestasn)[:20]))
             else:
                 logging.error("Case Error")
                 raise RuntimeError
@@ -130,7 +150,7 @@ def analyze_case(as_statistic, run_name, case):
                 logging.warning("Did not find probability for Measurement %s %s" % (case, run_name))
 
             probability = get_probability_for_route(as_statistic, case, route_asn)
-            logging.info("Probability for %8s-%30s is %f" % (route_asn, ip2asn.get_as_name(route_asn)[:30], probability))
+            logging.info("Probability for %8s-%30s is %f" % (route_asn, ip2as.get_as_name(route_asn)[:30], probability))
 
             for asn in asn_set:
                 # If AS appears on that route, sum it to the table
@@ -139,7 +159,7 @@ def analyze_case(as_statistic, run_name, case):
 
                 case_statistics.setdefault(multidestasn, dict()).setdefault(asn, dict())[route_asn] = probability
 
-
+    basic_logger.info("Evaluated %d concrete results" % result_cnt)
     return case_statistics
 
 
@@ -194,7 +214,7 @@ def write_case_stats(run_name, case, as_statistic, multiple_case_stat):
             for asn in sorted(case_stat.keys(), key=lambda x: (sum(case_stat[x].values()), x), reverse=True):
                 if {d:v for d,v in case_stat[asn].items() if v > 0}:  # Just print it if there is at least one route
                     fp.write("%-8s\t%-20s\t%-8f\t%-8f\t%-8f\t%-8d\t%s\n" % (asn,
-                                                                            ip2asn.get_as_name(asn)[:20],
+                                                                            ip2as.get_as_name(asn)[:20],
                                                                             sum(case_stat[asn].values()) - as_statistic[p].get(asn, 0),
                                                                             as_statistic[p].get(asn, 0),
                                                                             sum(case_stat[asn].values()),
@@ -225,7 +245,7 @@ def write_latex_table(run_name, case, as_statistic, multiple_case_stat):
                     nr_routes = len({d:v for d,v in case_stat[asn].items() if v > 0})
                     if prob > 0.025 or gain > 0.01 or nr_routes > 5:
                         fp.write("%-8s  & " % asn)
-                        fp.write("%-10s  & " % ip2asn.get_as_name(asn)[:10])
+                        fp.write("%-10s  & " % ip2as.get_as_name(asn)[:10])
                         fp.write("%-6s  & " % p)
                         fp.write("%-.3f  & " % prob if prob > 0 else "-         & ")
                         fp.write("%-.3f  & " % as_statistic[p].get(asn, 0) if as_statistic[p].get(asn, 0) > 0 else "-         & " )
@@ -273,7 +293,7 @@ def write_double_latex_table( run_name, as_statistic, name, entry_stat, exit_sta
             stat = dict()
 
             stat["asn"] = asn
-            stat["asname"] = ip2asn.get_as_name(asn)[:10]
+            stat["asname"] = ip2as.get_as_name(asn)[:10]
             stat["g_prob"] = sum(entry_stat.get(asn,{}).values())
             stat["e_prob"] = sum(exit_stat.get(asn,{}).values())
             stat["comb"] = stat["g_prob"] * stat["e_prob"]
@@ -314,20 +334,27 @@ def get_asn_set_from_traceroute(traceroute):
     logging.debug("Number Hops: %d" % len(traceroute["result"]))
 
     # If there is any error in the hops
+    timeouts = 0
     for hop in traceroute["result"]:
         if "error" in hop:
             logging.debug("Errors in Hop %s" % str(hop))
+        else:
+            # else, check if there are timeouts in the trace
+            hop_results = hop.get('result')
+            if hop_results is not None and len(hop_results) > 0 and 'x' in hop_results[0]:
+                timeouts += 1
 
-    # Does this traceroute contain timeouts
-    timeouts = len([hop for hop in traceroute["result"] if "x" in hop.get("result")[0]])
     if timeouts > 0:
-        logging.debug("Includes %d timeout" % timeouts)
+        logging.debug(f'Found {timeouts}')
 
-    # Check how many result sections are in each hop
-    len_list = [len(hop.get("result")) for hop in traceroute["result"]]
-
+    # Check how many result sections are in each hop if hop is non None (error)
+    len_list = [len(hop.get("result")) for hop in traceroute["result"] if hop.get('result') is not None]
+    len_set = set(len_list)
     # There are only simple result sections with one IP each
-    if set(len_list) == {1}:
+    if len(len_set) == 0:
+        logging.warning(f'Found 0 hops for {traceroute["msm_id"]}, possible error!')
+        f_hops = []
+    elif len_set == {1}:
         f_hops = [hop["result"][0]["from"] for hop in traceroute["result"] if "from" in hop["result"][0]]
         logging.debug("Simple Traceroute, only %d hops with 1 result each and %d IPs: %s" % (len(traceroute["result"]), len(f_hops), f_hops))
 
@@ -366,13 +393,13 @@ def get_asn_set_from_traceroute(traceroute):
 def translate_ips_to_asn(ips):
     # Add a set of all ASN for that list of IPs
     # Private IP Ranges should be AS0, so discard it afterwards
-    as_list = [ip2asn.ip2asn(ip) for ip in ips]
+    as_list = [ip2as.ip2asn(ip) for ip in ips]
     logging.debug("Found %s for traceroute" % str(as_list))
 
     return as_list
 
 
-def analyze_measurement(measurement):
+def analyze_measurement(measurement, ipv6=False):
     """
     Analyze one full measurement which consists of 4 cases
     """
@@ -402,9 +429,9 @@ def analyze_measurement(measurement):
 
     # Load the datafiles
     logging.info("Load data files")
-    ip2asn.load(BASE_DIR + "/" + measurement + "/data/ip2asn-v4.tsv")
+    ip2as.load(BASE_DIR + "/" + measurement + "/data/ip2asn-v4.tsv")
     details = data.load_details(BASE_DIR + "/" + measurement + "/data/details.json")
-    as_statistic = load_as_statistic(details)
+    as_statistic = load_as_statistic(details, ipv6)
     logging.info("... loaded")
 
     # Find for which cases there are directories
@@ -434,19 +461,23 @@ def analyze_measurement(measurement):
         write_case_stats(measurement, "exit", as_statistic, res_e)
         write_latex_table(measurement, "exit", as_statistic, res_e)
 
-    # TODO Fast hack to get results now
-    # if res_e.get("AS24940") and res_g.get("AS1764"):
-    #     write_double_latex_table(measurement, as_statistic, "AS1764-AS24940", res_g.get("AS1764"), res_e.get("AS24940"))
-    #
-    for cas, cas_result in res_g.items():
-        write_double_latex_table(measurement, as_statistic, "E-MAXSUM-FROM-"+cas, cas_result, res_e.get("MAXAND"))
+    if len(stats["case1"]) == len(stats["case2"]) == len(stats["case3"]) == len(stats["case4"]) == 1:
+        # SINGLE SRC/DST TEST
+        client_as = list(stats["case1"].keys())[0] #case1 as == case4 as
+        destination_as = list(stats["case2"].keys())[0] #case2 as == case3 as
+        if res_e.get(destination_as) and res_g.get(client_as):
+            write_double_latex_table(measurement, as_statistic, f"{client_as}-{destination_as}", res_g.get(client_as), res_e.get(destination_as))
+    else:
+        # MULTI SRC/DST TEST
+        for cas, cas_result in res_g.items():
+            write_double_latex_table(measurement, as_statistic, "E-MAXSUM-FROM-"+cas, cas_result, res_e.get("MAXAND"))
 
 
 def combine_results(s1, s2):
     if len(s1) == len(s2) == 0:
         return {}
     elif len(s1) == len(s2) == 1:
-
+        # SINGLE SRC/DST TEST
         name1, s1 = next(iter(s1.items()))
         name2, s2 = next(iter(s2.items()))
         if name1 != name2:
@@ -465,6 +496,7 @@ def combine_results(s1, s2):
         return result_table
 
     else:
+        # MULTI SRC/DST TEST
         key_set = set(s1.keys()) | set(s2.keys())
 
         result_table = {"MAXAND": dict()}
@@ -494,9 +526,26 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)-8s %(message)s')
 
-   # analyze_measurement("20191231-044005")
-    analyze_measurement("combined-top-de")
+    parser = argparse.ArgumentParser(description='Evaluate a given RIPETor measurement')
+    parser.add_argument('-i', '--input', required=True, type=str, help='Path to a given measurement')
+    parser.add_argument('-6', '--ipv6', action="store_true", default=False, help="Use IPv6 Only mode")
+    args = parser.parse_args()
 
+    basepath = args.input
+    basepath = pathlib.Path(basepath)
+    basepath = basepath.absolute()
 
+    if not basepath.exists():
+        logging.error(f'Given basepath {basepath} does not exist!')
+        exit(1)
+    elif basepath.is_file():
+        logging.error(f'Given basepath {basepath} exists but is a file!')
+        exit(1)
 
+    measurement = basepath.name
+    BASE_DIR = str(basepath.parent)
+    ipv6_mode = args.ipv6
 
+    logging.info(f'Working with measurement {measurement} in basepath {BASE_DIR}')
+
+    analyze_measurement(measurement, ipv6_mode)
